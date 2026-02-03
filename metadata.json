@@ -1,0 +1,22 @@
+{
+  "name": "JC US Trip 2026",
+  "short_name": "JC Trip",
+  "description": "Shared Travel Itinerary",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#E6DDD3",
+  "theme_color": "#C6934B",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/826/826070.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
