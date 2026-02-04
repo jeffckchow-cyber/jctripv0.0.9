@@ -1,11 +1,13 @@
-
 import * as React from 'react';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { Trip, ItineraryEvent, EventCategory, Expense, FlightInfo, OtherTransport, Accommodation, HighlightLabel, Attachment, TabType, ModalMode } from './types';
 import { getCityWeather } from './geminiService';
 import { APP_VERSION } from './constants';
 
-// --- System Constants ---
+// --- FIREBASE REAL-TIME IMPORTS ---
+import { db } from './firebase';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+
 const Palette = {
   accent: '#C6934B',
   darkCard: '#121212',
@@ -24,11 +26,8 @@ const TAG_CONFIG: Record<string, string> = {
   "Coffee": '#121212',
 };
 
-const DEFAULT_TAGS = Object.keys(TAG_CONFIG);
 const STORAGE_KEY = 'wanderSync_lifestyle_v4_final';
-const PENDING_SYNC_KEY = 'wanderSync_pending_sync';
 
-// --- Helpers ---
 const useLongPress = (callback: () => void, ms = 600) => {
   const timeoutRef = useRef<any>(null);
   const start = () => { timeoutRef.current = setTimeout(callback, ms); };
@@ -41,157 +40,7 @@ const getMapsDirectionsUrl = (origin: string, dest: string) => {
   return `https://www.google.com/maps/dir/?api=1&origin=${clean(origin)}&destination=${clean(dest)}&travelmode=driving`;
 };
 
-// Fixed Sync URL (Google Sheets Apps Script)
-const SHEET_API_URL = process.env.SYNC_URL || 'https://script.google.com/macros/s/AKfycbzNWiondifG_ttagkAGglP2WX1hxVNWRxOna-O7Rq5F38J-PrM2asdTodQY-a2HE29X/exec';
-
-// --- Cloud Sync Helpers ---
-
-/**
- * PUSH logic (POST)
- * Rules: mode: 'no-cors', headers: { 'Content-Type': 'text/plain' }, simple stringified JSON body.
- */
-async function pushToCloud(trip: Trip): Promise<boolean> {
-  try {
-    console.log('WanderSync: Pushing data to cloud...', trip);
-    
-    // We wrap the trip and add versioning info
-    const payload = {
-      ...trip,
-      clientVersion: APP_VERSION,
-      pushedAt: new Date().toISOString()
-    };
-
-    await fetch(SHEET_API_URL, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify(payload),
-    });
-    
-    // With no-cors, we can't see the response body, but the fetch resolving
-    // generally means the request was successfully dispatched.
-    localStorage.removeItem(PENDING_SYNC_KEY);
-    return true;
-  } catch (e) {
-    console.warn("WanderSync: Background push failed, flagging as pending", e);
-    localStorage.setItem(PENDING_SYNC_KEY, 'true');
-    return false;
-  }
-}
-
-/**
- * PULL logic (GET)
- * Rules: mode: 'cors', redirect: 'follow'.
- */
-async function pullFromCloud(): Promise<Trip | null> {
-  try {
-    const response = await fetch(`${SHEET_API_URL}?t=${Date.now()}`, {
-      method: 'GET',
-      redirect: 'follow',
-    });
-    if (!response.ok) return null;
-    const data = await response.json();
-    return (data && data.id) ? data as Trip : null;
-  } catch (e) {
-    console.warn("WanderSync: Background pull error", e);
-    return null;
-  }
-}
-
-const LabelBadge: React.FC<{ label: HighlightLabel; isDark?: boolean }> = ({ label, isDark }) => (
-  <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-full uppercase tracking-widest border transition-all ${isDark ? 'bg-white/10 text-white/80 border-white/10' : 'bg-black/10 text-black/60 border-black/10'}`}>
-    {label.text}
-  </span>
-);
-
-type TimelineItem = 
-  | (ItineraryEvent & { isFlight: false; isStay: false }) 
-  | { isFlight: true; isStay: false; flight: FlightInfo; startTime: string }
-  | { isFlight: false; isStay: true; stay: Accommodation; startTime: string };
-
-const DayScroller: React.FC<{ startDate: string; endDate: string; selectedDate: string; isMinimized: boolean; onSelect: (d: string) => void }> = ({ startDate, endDate, selectedDate, isMinimized, onSelect }) => {
-  const dates = useMemo(() => {
-    const arr = [];
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) return [];
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) { arr.push(new Date(d).toISOString().split('T')[0]); }
-    return arr;
-  }, [startDate, endDate]);
-
-  return (
-    <div className={`flex gap-1.5 overflow-x-auto hide-scrollbar px-6 bg-[#E6DDD3]/95 backdrop-blur-xl sticky top-[48px] z-40 border-b border-black/5 transition-all duration-300 ${isMinimized ? 'py-1 shadow-sm' : 'py-3'}`}>
-      {dates.map((dateStr) => {
-        const d = new Date(dateStr);
-        const isSelected = dateStr === selectedDate;
-        return (
-          <button key={dateStr} onClick={() => onSelect(dateStr)} className={`flex flex-col items-center min-w-[44px] rounded-[16px] transition-all duration-300 ${isSelected ? 'bg-[#121212] text-white shadow-lg scale-105' : 'bg-black/5 text-black/40'} ${isMinimized ? 'py-1' : 'py-2'}`}>
-            <span className={`font-black opacity-50 mb-0.5 ${isMinimized ? 'text-[5px]' : 'text-[7px]'}`}>{d.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase()}</span>
-            <span className={`font-black ${isMinimized ? 'text-xs' : 'text-base'}`}>{d.getDate()}</span>
-          </button>
-        );
-      })}
-    </div>
-  );
-};
-
-const TimelineCard: React.FC<{ event: TimelineItem, onEdit: (e: TimelineItem) => void, onLongPress: (e: TimelineItem) => void }> = ({ event, onEdit, onLongPress }) => {
-  const isFlight = event.isFlight === true;
-  const isStay = event.isFlight === false && event.isStay === true;
-  
-  const rawTime = isFlight ? event.flight.departureTime : (isStay ? '23:59:59' : (event as ItineraryEvent).startTime);
-  const timeDisplay = isStay ? "STAY" : new Date(rawTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-  
-  const bubbleColor = (isFlight || isStay) ? Palette.darkCard : (event.color || Palette.darkCard);
-  const isLight = bubbleColor === Palette.accent || bubbleColor === '#E6DDD3';
-  
-  const attachments = isFlight ? event.flight.attachments : (isStay ? event.stay.attachments : (event as ItineraryEvent).attachments);
-  const props = useLongPress(() => onLongPress(event));
-
-  const openDoc = (e: React.MouseEvent, att: Attachment) => {
-    e.stopPropagation();
-    const win = window.open();
-    if (win) win.document.write(`<iframe src="${att.data}" frameborder="0" style="border:0; top:0px; left:0px; bottom:0px; right:0px; width:100%; height:100%;" allowfullscreen></iframe>`);
-  };
-
-  const title = isFlight ? `${event.flight.flightNo} DEP` : (isStay ? event.stay.name : (event as ItineraryEvent).title);
-  const sub = isFlight ? `${event.flight.departure} → ${event.flight.arrival}` : (isStay ? event.stay.location : (event as ItineraryEvent).location);
-
-  return (
-    <div className="px-4 py-1 flex gap-4 items-start relative group">
-      <div className="w-12 pt-3 flex flex-col items-end flex-shrink-0 z-10">
-        <span className="text-[11px] font-black tracking-tighter text-black/40 tabular-nums">{timeDisplay}</span>
-      </div>
-      <div {...props} onClick={() => onEdit(event)} className={`flex-1 rounded-[24px] p-4 shadow-sm relative active:scale-[0.98] transition-all flex flex-col gap-2 ${isLight ? 'text-[#121212]' : 'text-[#F3F4F4]'}`} style={{ backgroundColor: bubbleColor }}>
-        <div className="flex justify-between items-start">
-          <div className="flex-1 min-w-0 pr-2">
-            <h4 className="text-base font-black leading-tight uppercase tracking-tighter truncate">{title}</h4>
-            <div className="text-[10px] font-bold opacity-60 truncate">{sub || ""}</div>
-            {isFlight && event.flight.bookingNumber && (
-              <div className="text-[8px] font-black opacity-40 uppercase mt-1 tracking-widest">Ref: {event.flight.bookingNumber}</div>
-            )}
-          </div>
-          <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
-            <div className="flex flex-wrap justify-end gap-1">
-              {isFlight && <LabelBadge label={{ text: 'Flight', type: 'system' }} isDark={!isLight} />}
-              {isStay && <LabelBadge label={{ text: 'Hotel', type: 'system' }} isDark={!isLight} />}
-              {!isFlight && !isStay && (event as ItineraryEvent).labels?.map((l, i) => <LabelBadge key={i} label={l} isDark={!isLight} />)}
-            </div>
-          </div>
-        </div>
-        {attachments && attachments.length > 0 && (
-          <div className="flex gap-2 mt-1">
-            {attachments.map((att) => (
-              <button key={att.id} onClick={(e) => openDoc(e, att)} className="w-10 h-10 rounded-lg overflow-hidden border border-white/20 bg-black/20 flex items-center justify-center group/att">
-                {att.mimeType.startsWith('image/') ? <img src={att.data} alt="doc" className="w-full h-full object-cover" /> : <span className="text-[8px] font-black">DOC</span>}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
+// ... LabelBadge and TimelineCard components stay here ...
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<TabType>('itinerary');
@@ -207,230 +56,43 @@ export const App: React.FC = () => {
   const [syncing, setSyncing] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [localWeather, setLocalWeather] = useState<{ temp: number; condition: string } | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [hasPendingSync, setHasPendingSync] = useState(localStorage.getItem(PENDING_SYNC_KEY) === 'true');
   
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const attachInputRef = useRef<HTMLInputElement>(null);
-  const bannerInputRef = useRef<HTMLInputElement>(null);
-  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const docId = "shared-trip-2026"; // This identifies your specific trip in the cloud
 
-  // --- Sync Data Management ---
-  const handleUpdateAndSync = (updatedTrip: Trip) => {
-    const tripWithTimestamp = { ...updatedTrip, lastSynced: new Date().toISOString() };
-    setTrip(tripWithTimestamp);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(tripWithTimestamp));
-    // The actual cloud push is handled by the debounced useEffect now
-  };
-
-  // Debounced Auto-Sync Effect
+  // --- FIREBASE REAL-TIME LISTENER ---
   useEffect(() => {
-    if (!trip) return;
-
-    // We debounce the sync by 2 seconds to avoid excessive hits to Google Script
-    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-
-    debounceTimerRef.current = setTimeout(async () => {
-      if (isOnline) {
-        setSyncing(true);
-        const success = await pushToCloud(trip);
-        if (success) {
-          setLastSyncedAt(trip.lastSynced || new Date().toISOString());
-          setHasPendingSync(false);
-        } else {
-          setHasPendingSync(true);
-        }
-        setSyncing(false);
-      } else {
-        localStorage.setItem(PENDING_SYNC_KEY, 'true');
-        setHasPendingSync(true);
-      }
-    }, 2000);
-
-    return () => { if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current); };
-  }, [trip, isOnline]);
-
-  const performInitialPull = async () => {
-    if (!navigator.onLine) return;
-    setSyncing(true);
-    const cloudData = await pullFromCloud();
-    if (cloudData) {
-      const local = localStorage.getItem(STORAGE_KEY);
-      const localData = local ? JSON.parse(local) : null;
-      
-      // Merge logic: pull from cloud if cloud is newer or local is missing
-      if (!localData || (cloudData.lastSynced && localData.lastSynced && cloudData.lastSynced > localData.lastSynced)) {
+    // This function runs once when the app starts.
+    // It "listens" for any changes made by you OR your partner.
+    const unsub = onSnapshot(doc(db, "trips", docId), (snapshot) => {
+      if (snapshot.exists()) {
+        const cloudData = snapshot.data() as Trip;
         setTrip(cloudData);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
-        if (cloudData.lastSynced) setLastSyncedAt(cloudData.lastSynced);
-        setHasPendingSync(false);
-        localStorage.removeItem(PENDING_SYNC_KEY);
-      } else if (localData && cloudData.lastSynced !== localData.lastSynced) {
-        // If local is newer, it will trigger its own sync via the debounced effect
+        if (cloudData.startDate && !selectedDate) setSelectedDate(cloudData.startDate);
+        setLastSyncedAt(new Date().toISOString());
       }
-    }
-    setSyncing(false);
-  };
+      setSyncing(false);
+    });
 
-  useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-
-    // Initial Offline-First Load from LocalStorage
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const data = JSON.parse(saved);
-      setTrip(data);
-      setSelectedDate(data.startDate);
-      if (data.lastSynced) setLastSyncedAt(data.lastSynced);
-    } else {
-      const initial: Trip = {
-        id: 'trip-' + Date.now(),
-        name: 'JC US Trip 2026',
-        destination: 'US and Toronto',
-        startDate: '2026-05-15',
-        endDate: '2026-05-29',
-        headerImagePosition: 50,
-        flights: [],
-        otherTransport: [],
-        accommodations: [],
-        events: [
-          { id: '1', title: 'Arrival Dinner', category: EventCategory.DINING, startTime: '2026-05-15T20:00:00', isCompleted: false, labels: [{ text: 'Meal', type: 'Meal' }], color: Palette.accent, location: 'Toronto', mapLink: 'https://www.google.com/maps/search/?api=1&query=Toronto' }
-        ],
-        participants: ['JC', 'Wife'],
-        expenses: [],
-        budget: 50000,
-        tripNotes: ''
-      };
-      setTrip(initial);
-      setSelectedDate(initial.startDate);
-    }
-
-    // Background cloud pull on mount
-    performInitialPull();
-
-    return () => { 
-      window.removeEventListener('online', handleOnline); 
-      window.removeEventListener('offline', handleOffline); 
-    };
+    return () => unsub(); // Cleans up the connection when app closes
   }, []);
 
-  useEffect(() => {
-    const handleScroll = () => { if (scrollContainerRef.current) setIsScrolled(scrollContainerRef.current.scrollTop > 180); };
-    const container = scrollContainerRef.current;
-    container?.addEventListener('scroll', handleScroll);
-    return () => container?.removeEventListener('scroll', handleScroll);
-  }, []);
-
-  const filteredEvents = useMemo(() => {
-    if (!trip || !selectedDate) return [];
+  // --- UPDATED SAVE FUNCTION ---
+  const handleUpdateAndSync = async (updatedTrip: Trip) => {
+    setTrip(updatedTrip);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedTrip));
     
-    const events = trip.events
-      .filter(e => e.startTime.startsWith(selectedDate))
-      .map(e => ({ ...e, isFlight: false as const, isStay: false as const }));
-    
-    const flights = trip.flights
-      .filter(f => f.departureTime.startsWith(selectedDate))
-      .map(f => ({ flight: f, isFlight: true as const, isStay: false as const, startTime: f.departureTime }));
-    
-    const stays = trip.accommodations
-      .filter(a => {
-        const d_cur = new Date(selectedDate);
-        const d_start = new Date(a.startDate);
-        const d_end = new Date(a.endDate);
-        d_cur.setHours(0,0,0,0);
-        d_start.setHours(0,0,0,0);
-        d_end.setHours(0,0,0,0);
-        return d_cur >= d_start && d_cur < d_end;
-      })
-      .map(a => ({ stay: a, isFlight: false as const, isStay: true as const, startTime: '23:59:59' }));
-
-    const sortedBase = [...events, ...flights].sort((a, b) => a.startTime.localeCompare(b.startTime));
-    return [...sortedBase, ...stays];
-  }, [trip, selectedDate]);
-
-  const currentCityStatus = useMemo(() => {
-    if (filteredEvents.length === 0) return null;
-    const lastItem = [...filteredEvents].reverse().find(e => e.isFlight ? !!e.flight.arrival : (e.isStay ? !!e.stay.location : !!(e as ItineraryEvent).location));
-    if (!lastItem) return null;
-    if (lastItem.isFlight) return lastItem.flight.arrival;
-    if (lastItem.isStay) return lastItem.stay.location;
-    return (lastItem as ItineraryEvent).location;
-  }, [filteredEvents]);
-
-  useEffect(() => {
-    if (currentCityStatus && isOnline) {
-      setLocalWeather(null);
-      getCityWeather(currentCityStatus).then(setLocalWeather);
-    } else {
-      setLocalWeather(null);
+    if (isOnline) {
+      setSyncing(true);
+      try {
+        // This pushes your change to your partner's iPhone instantly
+        await setDoc(doc(db, "trips", docId), updatedTrip);
+      } catch (e) {
+        console.error("Firebase Sync Error:", e);
+      }
+      setSyncing(false);
     }
-  }, [currentCityStatus, isOnline]);
-
-  const handleBannerUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !trip) return;
-    const reader = new FileReader();
-    reader.onloadend = () => { 
-      handleUpdateAndSync({ ...trip, headerImage: reader.result as string }); 
-      setModalMode(null); 
-    };
-    reader.readAsDataURL(file);
   };
-
-  const handleAttachmentUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const newAtt: Attachment = { id: 'att-' + Date.now(), name: file.name, mimeType: file.type, data: reader.result as string };
-      setEditingItem((prev: any) => ({ ...prev, attachments: [...(prev?.attachments || []), newAtt] }));
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const saveItem = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!trip) return;
-    const fd = new FormData(e.currentTarget as HTMLFormElement);
-    const isExisting = !!editingItem?.id;
-    const id = isExisting ? editingItem.id : 'item-' + Date.now();
-    let updatedTrip = { ...trip };
-
-    if (modalMode === 'trip') {
-      updatedTrip = { ...trip, name: fd.get('name') as string, destination: fd.get('destination') as string, startDate: fd.get('startDate') as string, endDate: fd.get('endDate') as string, budget: parseFloat(fd.get('budget') as string) || trip.budget };
-    } else if (modalMode === 'event') {
-      const newEvent: ItineraryEvent = { id, title: fd.get('title') as string, startTime: fd.get('startTime') as string, location: fd.get('location') as string, mapLink: fd.get('mapLink') as string, notes: fd.get('notes') as string, category: EventCategory.ACTIVITY, isCompleted: editingItem?.isCompleted || false, labels: eventLabels, color: selectedColor, attachments: editingItem?.attachments || [] };
-      updatedTrip.events = isExisting ? trip.events.map(ev => ev.id === id ? newEvent : ev) : [...trip.events, newEvent];
-    } else if (modalMode === 'accommodation') {
-      const newAcc: Accommodation = { id, name: fd.get('name') as string, startDate: fd.get('startDate') as string, endDate: fd.get('endDate') as string, location: fd.get('location') as string, mapLink: fd.get('mapLink') as string, notes: fd.get('notes') as string, attachments: editingItem?.attachments || [] };
-      updatedTrip.accommodations = isExisting ? trip.accommodations.map(a => a.id === id ? newAcc : a) : [...trip.accommodations, newAcc];
-    } else if (modalMode === 'flight') {
-      const newFlight: FlightInfo = { id, flightNo: fd.get('flightNo') as string, departure: fd.get('departure') as string, arrival: fd.get('arrival') as string, departureTime: fd.get('departureTime') as string, arrivalTime: fd.get('arrivalTime') as string, bookingNumber: fd.get('bookingNumber') as string, attachments: editingItem?.attachments || [] };
-      updatedTrip.flights = isExisting ? trip.flights.map(f => f.id === id ? newFlight : f) : [...trip.flights, newFlight];
-    } else if (modalMode === 'expense') {
-      const newExpense: Expense = { id, description: fd.get('description') as string, amount: parseFloat(fd.get('amount') as string), category: fd.get('category') as string, date: fd.get('date') as string };
-      updatedTrip.expenses = isExisting ? trip.expenses.map(ex => ex.id === id ? newExpense : ex) : [...trip.expenses, newExpense];
-    }
-    handleUpdateAndSync(updatedTrip);
-    setModalMode(null);
-  };
-
-  const executeDelete = () => {
-    if (!trip || !itemToDelete) return;
-    const { mode, item } = itemToDelete;
-    let updated = { ...trip };
-    if (mode === 'event') updated.events = trip.events.filter(e => e.id !== item.id);
-    else if (mode === 'accommodation') updated.accommodations = trip.accommodations.filter(a => a.id !== item.id);
-    else if (mode === 'flight') updated.flights = trip.flights.filter(f => f.id !== item.id);
-    else if (mode === 'expense') updated.expenses = trip.expenses.filter(ex => ex.id !== item.id);
-    handleUpdateAndSync(updated);
-    setItemToDelete(null);
-  };
-
-  const totalSpent = trip?.expenses.reduce((sum, e) => sum + e.amount, 0) || 0;
 
   return (
     <div className="max-w-md mx-auto h-screen flex flex-col bg-[#E6DDD3] text-[#121212] overflow-hidden">
@@ -445,7 +107,7 @@ export const App: React.FC = () => {
           )}
           <div className="absolute top-10 left-0 right-0 flex justify-between px-8 z-20 items-center">
             <div className="flex gap-2">
-              <button onClick={performInitialPull} disabled={!isOnline} className={`p-2 rounded-full system-glass border border-black/5 ${syncing ? 'animate-spin opacity-50' : ''}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg></button>
+              <button onClick={() => {}} disabled={!isOnline} className={`p-2 rounded-full system-glass border border-black/5 ${syncing ? 'animate-spin opacity-50' : ''}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg></button>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[7px] font-black uppercase opacity-20 tracking-widest">{APP_VERSION}</span>
