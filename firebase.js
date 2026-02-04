@@ -1,11 +1,6 @@
-// Import the functions you need from the SDKs you need
 import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+import { getFirestore } from "firebase/firestore";
 
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyARexIdke8cs9dV8yA3tQEt6KROjq34VvQ",
   authDomain: "jctripv009.firebaseapp.com",
@@ -16,6 +11,6 @@ const firebaseConfig = {
   measurementId: "G-25YDYGNJ15"
 };
 
-// Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+// This 'db' is what allows you and your partner to share data
+export const db = getFirestore(app);
